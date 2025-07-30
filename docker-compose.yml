@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   zookeeper:
     image: harbor.narvanventures.com/dockerhub/confluentinc/cp-zookeeper:7.3.1
@@ -7,11 +5,15 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
     healthcheck:
       test: ["CMD", "echo", "ruok", "|", "nc", "-w", "1", "localhost", "2181"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - kafka-network
 
   broker:
     image: harbor.narvanventures.com/dockerhub/confluentinc/cp-kafka:7.3.1
@@ -39,6 +41,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    networks:
+      - kafka-network
 
   postgres:
     image: harbor.narvanventures.com/dockerhub/postgres:15-alpine
@@ -46,21 +50,32 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=5", "-c", "max_wal_senders=5"]
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=5"
+      - "-c"
+      - "max_wal_senders=5"
     volumes:
       - ./postgres-init/:/docker-entrypoint-initdb.d/
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - kafka-network
 
-  connect:
-    image: harbor.narvanventures.com/dockerhub/debezium/connect:2.5
-    container_name: connect
+  postgres-connect:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres-connect
+    container_name: postgres-connect
     depends_on:
       broker:
         condition: service_healthy
@@ -70,17 +85,68 @@ services:
       - "8083:8083"
     environment:
       BOOTSTRAP_SERVERS: "broker:29092"
-      GROUP_ID: 1
-      CONFIG_STORAGE_TOPIC: debezium_config
-      OFFSET_STORAGE_TOPIC: debezium_offset
-      STATUS_STORAGE_TOPIC: debezium_status
+      CONFIG_STORAGE_TOPIC: pg_config
+      OFFSET_STORAGE_TOPIC: pg_offset
+      STATUS_STORAGE_TOPIC: pg_status
       KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /kafka/connect/plugins/postgres
+      GROUP_ID: pg-cdc-group
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connector-plugins"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 20s
+    networks:
+      - kafka-network
+
+  clickhouse:
+    image: harbor.narvanventures.com/dockerhub/clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - kafka-network
+    depends_on:
+      - broker
+
+  clickhouse-connect:
+    image: harbor.narvanventures.com/dockerhub/confluentinc/cp-kafka-connect:7.3.1
+    container_name: clickhouse-connect
+    ports:
+      - "8084:8083"
+    environment:
+      - CONNECT_BOOTSTRAP_SERVERS=broker:29092
+      - CONNECT_REST_ADVERTISED_HOST_NAME=clickhouse-connect
+      - CONNECT_GROUP_ID=clickhouse-connect-group
+      - CONNECT_CONFIG_STORAGE_TOPIC=_clickhouse-connect-configs
+      - CONNECT_OFFSET_STORAGE_TOPIC=_clickhouse-connect-offsets
+      - CONNECT_STATUS_STORAGE_TOPIC=_clickhouse-connect-status
+      - CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR=1
+      - CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR=1
+      - CONNECT_STATUS_STORAGE_REPLICATION_FACTOR=1
+      - CONNECT_KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false
+      - CONNECT_PLUGIN_PATH=/usr/share/confluent-hub-components
+    volumes:
+      - ./jars:/usr/share/confluent-hub-components/clickhouse-kafka-connect/lib
+    networks:
+      - kafka-network
+    depends_on:
+      - broker
+
+
+volumes:
+  clickhouse_data:
+
+networks:
+  kafka-network:
+    driver: bridge

@@ -1,0 +1,7 @@
+FROM harbor.narvanventures.com/dockerhub/debezium/connect:2.5
+
+RUN mkdir -p /kafka/connect/plugins/postgres && \
+    curl -L -o /kafka/connect/plugins/postgres/debezium-connector-postgres-2.5.0.Final-plugin.tar.gz https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.5.0.Final/debezium-connector-postgres-2.5.0.Final-plugin.tar.gz && \
+    cd /kafka/connect/plugins/postgres && \
+    tar -xzf debezium-connector-postgres-2.5.0.Final-plugin.tar.gz && \
+    rm debezium-connector-postgres-2.5.0.Final-plugin.tar.gz
