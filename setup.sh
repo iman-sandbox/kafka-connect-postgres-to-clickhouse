@@ -1,158 +1,158 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# Load or create .env
-if [ ! -f .env ]; then
-  echo "Creating default .env file..."
-  cat <<EOF > .env
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-POSTGRES_DB=postgres
-EOF
-fi
-source .env
+PG_CONTAINER=postgres
+CH_CONTAINER=clickhouse
+DB=iman
+USER=postgres
 
+# 🧹 Cleanup
+docker compose down -v
+
+# 🚀 Start containers
 echo "🟢 Starting Docker Compose services..."
-docker compose down -v --remove-orphans
-docker compose build postgres-connect clickhouse-connect
-docker compose up -d
+docker compose up -d --build
 
-echo -e "\n⏳ Waiting for all services to be healthy..."
-until docker exec zookeeper echo ruok | nc -w1 localhost 2181; do sleep 1; done
-until docker exec broker bash -c "nc -z broker 9092"; do sleep 1; done
-until docker exec postgres pg_isready -U "$POSTGRES_USER"; do sleep 1; done
-until curl -fs http://localhost:8083/connector-plugins >/dev/null; do sleep 1; done
-until curl -fs http://localhost:8084/connector-plugins >/dev/null; do sleep 1; done
+# ⏳ Wait for readiness
+sleep 10
+until docker exec $PG_CONTAINER pg_isready -U $USER; do sleep 2; done
+until docker exec zookeeper bash -c 'echo ruok | nc -w 1 localhost 2181'; do sleep 2; done
 
+# Ensure ClickHouse database exists
+echo "🗃 Creating ClickHouse database and schema '$DB'..."
+docker exec -i $CH_CONTAINER clickhouse-client --query "CREATE DATABASE IF NOT EXISTS $DB;"
+docker exec -i $CH_CONTAINER clickhouse-client --query "USE $DB;"
+
+# 📦 Extract schema and generate DDL
 echo "📦 Extracting PostgreSQL schema and generating ClickHouse DDL..."
-docker exec postgres psql -U postgres -d postgres -Atc "
-SELECT
-  'CREATE TABLE IF NOT EXISTS ' || c.table_name || '_cdc (' ||
-  string_agg('after_' || c.column_name || ' ' ||
-             CASE
-               WHEN c.data_type = 'integer' THEN 'Int32'
-               WHEN c.data_type = 'bigint' THEN 'Int64'
-               WHEN c.data_type = 'character varying' THEN 'String'
-               WHEN c.data_type = 'text' THEN 'String'
-               WHEN c.data_type = 'timestamp without time zone' THEN 'UInt64'
-               ELSE 'String'
-             END, ', ') ||
-  ', op String) ENGINE = MergeTree ORDER BY after_' || pk.column_name || ';' ||
+DDL=$(docker exec $PG_CONTAINER psql -U $USER -d $DB -Atc "SELECT 'CREATE TABLE IF NOT EXISTS iman.users (' ||
+  string_agg(column_name || ' ' ||
+    CASE data_type
+      WHEN 'integer' THEN 'Int32'
+      WHEN 'bigint' THEN 'Int64'
+      WHEN 'numeric' THEN 'Decimal(18,2)'
+      WHEN 'text' THEN 'String'
+      WHEN 'character varying' THEN 'String'
+      WHEN 'timestamp without time zone' THEN 'DateTime'
+      WHEN 'uuid' THEN 'UUID'
+      ELSE 'String'
+    END, ', ') || ') ENGINE = ReplacingMergeTree() ORDER BY user_id;' \
+  FROM information_schema.columns \
+  WHERE table_name = 'users';")
 
-  ' CREATE TABLE IF NOT EXISTS ' || c.table_name || ' (' ||
-  string_agg(c.column_name || ' ' ||
-             CASE
-               WHEN c.data_type = 'integer' THEN 'Int32'
-               WHEN c.data_type = 'bigint' THEN 'Int64'
-               WHEN c.data_type = 'character varying' THEN 'String'
-               WHEN c.data_type = 'text' THEN 'String'
-               WHEN c.data_type = 'timestamp without time zone' THEN 'DateTime'
-               ELSE 'String'
-             END, ', ') ||
-  CASE WHEN bool_or(c.column_name = 'updated_at') THEN ''
-       ELSE ', updated_at DateTime DEFAULT now()'
-  END ||
-  ') ENGINE = ReplacingMergeTree(updated_at) ORDER BY ' || pk.column_name || ';' ||
-
-  ' CREATE MATERIALIZED VIEW IF NOT EXISTS ' || c.table_name || '_mv TO ' || c.table_name || ' AS SELECT ' ||
-  string_agg('after_' || c.column_name || ' AS ' || c.column_name, ', ') ||
-  CASE WHEN bool_or(c.column_name = 'updated_at') THEN ''
-       ELSE ', now() AS updated_at'
-  END ||
-  ' FROM ' || c.table_name || '_cdc WHERE op IN (''c'', ''u'', ''r'');'
-FROM information_schema.columns c
-JOIN (
-  SELECT ku.table_name, ku.column_name
-  FROM information_schema.key_column_usage ku
-  JOIN information_schema.table_constraints tc
-    ON ku.constraint_name = tc.constraint_name
-   AND ku.table_schema = tc.table_schema
-  WHERE tc.constraint_type = 'PRIMARY KEY'
-) pk ON pk.table_name = c.table_name
-WHERE c.table_schema = 'public'
-GROUP BY c.table_name, pk.column_name;" > clickhouse-ddl.sql
-
+# 🛠 Apply DDL
 echo "🛠 Applying generated DDL to ClickHouse..."
-docker exec -i clickhouse clickhouse-client --multiquery < clickhouse-ddl.sql
+docker exec $CH_CONTAINER clickhouse-client --query "$DDL"
 
+# 🔌 Register PostgreSQL Source Connector
 echo "🧩 Registering Debezium PostgreSQL source connector..."
-curl -s -X POST http://localhost:8083/connectors \
+curl -X PUT http://localhost:8083/connectors/postgres-source-connector/config \
   -H "Content-Type: application/json" \
   -d '{
     "name": "postgres-source-connector",
-    "config": {
-      "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-      "database.hostname": "postgres",
-      "database.port": "5432",
-      "database.user": "postgres",
-      "database.password": "postgres",
-      "database.dbname": "postgres",
-      "database.server.name": "postgres_cdc",
-      "plugin.name": "pgoutput",
-      "snapshot.mode": "initial",
-      "slot.drop.on.stop": "true",
-      "slot.name": "debezium_slot",
-      "publication.autocreate.mode": "filtered",
-      "schema.include.list": "public",
-      "topic.prefix": "postgres_cdc",
-      "tombstones.on.delete": "false",
-      "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-      "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-      "value.converter.schemas.enable": "false",
-      "transforms": "flatten",
-      "transforms.flatten.type": "org.apache.kafka.connect.transforms.Flatten$Value",
-      "transforms.flatten.delimiter": "_"
-    }
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.password": "postgres",
+    "database.dbname": "iman",
+    "schema.include.list": "iman",
+    "database.server.name": "postgres_cdc",
+    "topic.prefix": "postgres_cdc",
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_slot",
+    "publication.autocreate.mode": "filtered",
+    "snapshot.mode": "initial",
+    "slot.drop.on.stop": "true",
+    "tombstones.on.delete": "false",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": true,
+    "value.converter.schemas.enable": true,
+
+    "producer.override.acks": "all",
+    "producer.override.retries": 10,
+    "producer.override.delivery.timeout.ms": 60000,
+
+    "transforms": "unwrap",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "true"
   }'
 
+# 🔌 Register ClickHouse Sink Connector
 echo "🧩 Registering ClickHouse Sink connector..."
-curl -s -X POST http://localhost:8084/connectors -H "Content-Type:application/json" \
+curl -X POST http://localhost:8084/connectors \
+  -H "Content-Type: application/json" \
   -d '{
     "name": "clickhouse-sink-connector",
     "config": {
-      "clickhouse.url": "http://clickhouse:8123",
       "connector.class": "com.clickhouse.kafka.connect.ClickHouseSinkConnector",
-      "tasks.max": "1",
-      "topics.regex": "postgres_cdc.public.*",
+      "topics": "postgres_cdc.iman.users",
+      "topics.mapping": "postgres_cdc.iman.users:users",
       "hostname": "clickhouse",
       "port": "8123",
-      "database": "default",
-      "username": "default",
-      "password": "",
+      "database": "iman",
+      "user": "default",
+      "password": "password",
+      "secure": "false",
+      "compression": "false",
+      "group.id": "clickhouse-connect-group",
+      "consumer.override.auto.offset.reset": "earliest",
+      "consumer.override.enable.auto.commit": "false",
+      "consumer.override.max.poll.records": "1000",
+      "consumer.override.session.timeout.ms": "60000",
+      "key.converter": "org.apache.kafka.connect.json.JsonConverter",
       "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-      "value.converter.schemas.enable": "false",
-      "key.converter": "org.apache.kafka.connect.storage.StringConverter",
-      "insert.mode": "insert",
-      "errors.log.enable": true,
-      "errors.log.include.messages": true,
-      "errors.retry.timeout": "60000",
-      "errors.retry.delay.max.ms": "5000"
+      "key.converter.schemas.enable": true,
+      "value.converter.schemas.enable": true,
+      "tasks.max": "1",
+      "auto.create.tables": "true",
+      "auto.evolve.tables": "true",
+      "table.engine": "ReplacingMergeTree",
+      "table.primaryKey": "user_id",
+      "deduplication.policy": "preserve_insert_order",
+      "errors.tolerance": "all",
+      "errors.log.enable": "true",
+      "errors.log.include.messages": "true"
     }
   }'
 
+
+# 📝 Insert test rows into Postgres
 echo "📝 Inserting test rows into PostgreSQL..."
-docker exec -i postgres psql -U postgres -d postgres -c "
-  INSERT INTO users (username, account_type) VALUES
-  ('user1', 'Bronze'),
-  ('user2', 'Silver'),
-  ('user3', 'Gold');
-"
+docker exec -i $PG_CONTAINER psql -U $USER -d $DB <<EOF
+INSERT INTO iman.users (user_id, username, account_type, updated_at, created_at)
+VALUES
+  (1, 'user1', 'Bronze', now(), now()),
+  (2, 'user2', 'Silver', now(), now()),
+  (3, 'user3', 'Gold', now(), now());
+EOF
 
-echo "⏳ Waiting for CDC event in Kafka topic..."
-for i in {1..10}; do
-  OUT=$(docker exec broker kafka-console-consumer \
-    --bootstrap-server broker:29092 \
-    --topic postgres_cdc.public.users \
-    --from-beginning --timeout-ms 2000 --max-messages 1 2>/dev/null)
-  if echo "$OUT" | grep -q after_username; then
-    echo "$OUT"
-    break
-  fi
-  sleep 2
-done
-
-echo -e "\n⏳ Waiting for sink to apply to ClickHouse..."
+# ⌛ Wait for sync
 sleep 10
 
-echo "🔎 Verifying ClickHouse synchronization:"
-docker exec clickhouse clickhouse-client --query "SELECT * FROM default.users FORMAT JSON"
+# ✅ Integration verification
+echo "📊 Rows in PostgreSQL:"
+docker exec -i $PG_CONTAINER psql -U $USER -d $DB -c "SELECT * FROM iman.users"
+
+echo "📬 Messages in Kafka topic:"
+docker exec broker kafka-console-consumer \
+  --bootstrap-server broker:29092 \
+  --topic postgres_cdc.iman.users \
+  --from-beginning --timeout-ms 5000
+
+echo "🏁 Rows in ClickHouse:"
+docker exec $CH_CONTAINER clickhouse-client --query "SELECT * FROM iman.users FORMAT Vertical"
+
+# ✅ Final assertion
+ACTUAL=$(docker exec $CH_CONTAINER clickhouse-client --query "SELECT user_id, username, account_type FROM iman.users ORDER BY user_id FORMAT TSV" || echo "ERROR")
+EXPECTED=$'1\tuser1\tBronze\n2\tuser2\tSilver\n3\tuser3\tGold'
+
+if [[ "$ACTUAL" == "$EXPECTED" ]]; then
+  echo "✅ Integration test passed. Data synced correctly."
+else
+  echo "❌ Integration test failed. Data mismatch."
+  echo -e "\nExpected:\n$EXPECTED\nGot:\n$ACTUAL"
+  exit 1
+fi
