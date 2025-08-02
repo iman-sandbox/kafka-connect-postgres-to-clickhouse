@@ -1,6 +1,6 @@
 services:
   zookeeper:
-    image: harbor.narvanventures.com/dockerhub/confluentinc/cp-zookeeper:7.3.1
+    image: confluentinc/cp-zookeeper:7.3.1
     container_name: zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
@@ -16,7 +16,7 @@ services:
       - kafka-network
 
   broker:
-    image: harbor.narvanventures.com/dockerhub/confluentinc/cp-kafka:7.3.1
+    image: confluentinc/cp-kafka:7.3.1
     container_name: broker
     depends_on:
       zookeeper:
@@ -45,7 +45,7 @@ services:
       - kafka-network
 
   postgres:
-    image: harbor.narvanventures.com/dockerhub/postgres:15-alpine
+    image: postgres:15-alpine
     container_name: postgres
     ports:
       - "5432:5432"
@@ -104,7 +104,7 @@ services:
       - kafka-network
 
   clickhouse:
-    image: harbor.narvanventures.com/dockerhub/clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:latest
     container_name: clickhouse
     environment:
       CLICKHOUSE_USER: default
@@ -121,7 +121,7 @@ services:
       - broker
 
   clickhouse-connect:
-    image: harbor.narvanventures.com/dockerhub/confluentinc/cp-kafka-connect:7.3.1
+    image: confluentinc/cp-kafka-connect:7.3.1
     container_name: clickhouse-connect
     ports:
       - "8084:8083"
@@ -141,6 +141,7 @@ services:
       - CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE=false
       - CONNECT_PLUGIN_PATH=/usr/share/confluent-hub-components
     volumes:
+    # Download `clickhouse-kafka-connect-v1.3.2-confluent.jar if not exist in your` ./jars directory
       - ./jars:/usr/share/confluent-hub-components/clickhouse-kafka-connect/lib
     networks:
       - kafka-network
