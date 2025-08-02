@@ -1,2 +1,2 @@
 .env
-jars/clickhouse-kafka-connect-v1.3.2-confluent.jar
+clickhouse-ddl.sql
