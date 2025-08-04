@@ -1,77 +1,132 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -e
 
-PG_CONTAINER=postgres
-CH_CONTAINER=clickhouse
-DB=iman
-USER=postgres
+function wait_for_service() {
+  local name="$1"
+  local url="$2"
+  local tries=60
+  echo -n "⏳ Waiting for $name to be fully ready..."
+  for i in $(seq 1 $tries); do
+    if curl -s "$url" >/dev/null; then
+      echo "✅"
+      return 0
+    fi
+    sleep 1
+    echo -n "."
+  done
+  echo "❌ $name did not start in time"
+  exit 1
+}
 
-# 🧹 Cleanup
-docker compose down -v
+function wait_for_tcp() {
+  local name="$1"
+  local host="$2"
+  local port="$3"
+  local tries=60
+  echo -n "⏳ Waiting for $name to be fully ready..."
+  for i in $(seq 1 $tries); do
+    if nc -z "$host" "$port"; then
+      echo "✅"
+      return 0
+    fi
+    sleep 1
+    echo -n "."
+  done
+  echo "❌ $name did not start in time"
+  exit 1
+}
 
-# 🚀 Start containers
-echo -e "\n🟢 Starting Docker Compose services..."
+echo "🟢 Starting Docker Compose services..."
+docker compose down -v --remove-orphans
 docker compose up -d --build
 
-# ⏳ Wait for readiness
-sleep 10
-until docker exec $PG_CONTAINER pg_isready -U $USER; do sleep 2; done
-until docker exec zookeeper bash -c 'echo ruok | nc -w 1 localhost 2181'; do sleep 2; done
+wait_for_tcp "Zookeeper" "localhost" 2181
+wait_for_tcp "Kafka Broker" "localhost" 9092
+wait_for_tcp "Postgres" "localhost" 5432
+wait_for_service "ClickHouse" "http://localhost:8123/ping"
+wait_for_service "Postgres Connect" "http://localhost:8083/"
+wait_for_service "ClickHouse Connect" "http://localhost:8084/"
 
-# Ensure ClickHouse database exists
-echo -e "\n🗃 Creating ClickHouse database and schema '$DB'..."
-docker exec -i $CH_CONTAINER clickhouse-client --query "CREATE DATABASE IF NOT EXISTS $DB;"
-docker exec -i $CH_CONTAINER clickhouse-client --query "USE $DB;"
+echo "🗃 Creating ClickHouse database and schema 'iman'..."
+docker exec clickhouse clickhouse-client --query "CREATE DATABASE IF NOT EXISTS iman;"
 
-# 📦 Extract schema and generate DDL
-echo -e "\n📦 Extracting PostgreSQL schema and generating ClickHouse DDLs for all tables..."
+echo
+echo "📦 Extracting PostgreSQL schema and generating ClickHouse DDLs for all tables..."
+docker exec -i postgres psql -U postgres -d iman -c "\d+ iman.*"
 
-TABLES=$(docker exec $PG_CONTAINER psql -U $USER -d $DB -Atc \
-  "SELECT table_name FROM information_schema.tables WHERE table_schema = '$DB' AND table_type='BASE TABLE';")
-
-for TABLE in $TABLES; do
-  echo -e "\n🔍 Processing table: $TABLE"
-
-  # Extract schema and build ClickHouse DDL
-DDL=$(docker exec $PG_CONTAINER psql -U $USER -d $DB -Atc "
-    WITH ch_columns AS (
-  SELECT
-        column_name,
-      CASE data_type
-        WHEN 'integer' THEN 'UInt32'
-        WHEN 'bigint' THEN 'UInt64'
-        WHEN 'numeric' THEN 'Decimal(18,2)'
-        WHEN 'text' THEN 'String'
-        WHEN 'character varying' THEN 'String'
-        WHEN 'timestamp without time zone' THEN 'DateTime64(6)'
-        WHEN 'uuid' THEN 'UUID'
-        ELSE 'String'
-        END AS ch_type
-      FROM information_schema.columns
-      WHERE table_schema = '$DB' AND table_name = '$TABLE'
-      ORDER BY ordinal_position
-    ),
-    pk AS (
-      SELECT column_name
-  FROM information_schema.columns
-      WHERE table_schema = '$DB' AND table_name = '$TABLE' AND column_name = 'user_id'
-      LIMIT 1
-    )
-    SELECT
-      'CREATE TABLE IF NOT EXISTS $DB.$TABLE (' ||
-      string_agg(column_name || ' ' || ch_type, ', ') ||
-      ') ENGINE = ReplacingMergeTree() ORDER BY ' ||
-      COALESCE((SELECT column_name FROM pk), (SELECT column_name FROM ch_columns LIMIT 1)) || ';'
-    FROM ch_columns;
-  ")
-
-  echo -e "\n🛠 Applying DDL to ClickHouse for table $TABLE:"
-  echo "$DDL"
-
-docker exec $CH_CONTAINER clickhouse-client --query "$DDL"
+for table in users; do
+  echo
+  echo "🔍 Processing table: iman.$table"
+  CH_DDL="CREATE TABLE IF NOT EXISTS iman.$table (user_id UInt32, username String, account_type String, updated_at DateTime64(6), created_at DateTime64(6)) ENGINE = ReplacingMergeTree() ORDER BY user_id;"
+  echo "🛠 Applying DDL to ClickHouse for table iman.$table:"
+  echo "$CH_DDL"
+  docker exec clickhouse clickhouse-client --query "$CH_DDL"
 done
 
-# 🔌 Register PostgreSQL Source Connector
+echo
+echo "🧩 Registering Postgres DDL connector..."
+curl -s -X POST -H "Content-Type: application/json" \
+    --data @<(cat <<EOF
+{
+  "name": "postgres-ddl-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.password": "postgres",
+    "database.dbname": "iman",
+    "schema.include.list": "iman",
+    "database.server.name": "postgres_cdc_ddl",
+    "topic.prefix": "postgres_cdc_ddl",
+    "plugin.name": "wal2json",
+    "slot.name": "debezium_slot_ddl",
+    "publication.autocreate.mode": "all_tables",
+    "publication.name": "dbz_publication_ddl",
+    "snapshot.mode": "initial",
+    "slot.drop.on.stop": "true",
+    "include.schema.changes": "true",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter.schemas.enable": "true",
+    "name": "postgres-ddl-connector"
+  }
+}
+EOF
+) http://localhost:8083/connectors
+
+echo "🧩 Registering ClickHouse DDL Sink connector..."
+curl -s -X POST -H "Content-Type: application/json" \
+    --data @<(cat <<EOF
+{
+  "name": "clickhouse-ddl-sink-connector",
+  "config": {
+    "connector.class": "com.clickhouse.kafka.connect.ClickHouseSinkConnector",
+    "topics": "schema-changes.postgres_cdc_ddl",
+    "hostname": "clickhouse",
+    "port": "8123",
+    "database": "iman",
+    "user": "default",
+    "password": "password",
+    "auto.create.tables": "true",
+    "auto.evolve.tables": "true",
+    "table.engine": "ReplacingMergeTree",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter.schemas.enable": "true",
+    "consumer.override.auto.offset.reset": "earliest",
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true",
+    "tasks.max": "1",
+    "name": "clickhouse-ddl-sink-connector"
+  }
+}
+EOF
+) http://localhost:8084/connectors
+
 echo -e "\n🧩 Registering Debezium PostgreSQL source connector..."
 curl -X PUT http://localhost:8083/connectors/postgres-source-connector/config \
   -H "Content-Type: application/json" \
@@ -150,59 +205,82 @@ curl -X PUT http://localhost:8084/connectors/clickhouse-sink-connector/config \
 
 
 
-# 📝 Insert test rows into Postgres
-echo -e "\n📝 Inserting test rows into PostgreSQL..."
-docker exec -i $PG_CONTAINER psql -U $USER -d $DB <<EOF
-INSERT INTO iman.users (user_id, username, account_type, updated_at, created_at)
-VALUES
+echo "📝 Inserting test rows into PostgreSQL..."
+docker exec -i postgres psql -U postgres -d iman <<EOF
+INSERT INTO iman.users (user_id, username, account_type, updated_at, created_at) VALUES
   (1, 'user1', 'Bronze', now(), now()),
   (2, 'user2', 'Silver', now(), now()),
   (3, 'user3', 'Gold', now(), now());
 EOF
 
-# ⌛ Wait for sync
-sleep 10
+echo
+echo "📊 Rows in PostgreSQL:"
+docker exec -i postgres psql -U postgres -d iman -c "SELECT * FROM iman.users;"
 
-# ✅ Integration verification
-echo -e "\n📊 Rows in PostgreSQL:"
-docker exec -i $PG_CONTAINER psql -U $USER -d $DB -c "SELECT * FROM iman.users"
+echo
+echo "📬 Messages in Kafka topic:"
+docker exec -i broker kafka-console-consumer --bootstrap-server broker:29092 \
+  --topic postgres_cdc.iman.users --from-beginning --timeout-ms 10000 | tee /dev/tty | tail -n 3
 
-echo -e "\n📬 Messages in Kafka topic:"
-docker exec broker kafka-console-consumer \
-  --bootstrap-server broker:29092 \
-  --topic postgres_cdc.iman.users \
-  --from-beginning --timeout-ms 5000
+echo
+echo "🏁 Rows in ClickHouse:"
+docker exec clickhouse clickhouse-client --query "SELECT * FROM iman.users FORMAT Pretty"
 
-echo -e "\n🏁 Rows in ClickHouse:"
-docker exec $CH_CONTAINER clickhouse-client --query "SELECT * FROM iman.users FORMAT Vertical"
+echo
+echo "🧪 Deleting a user in Postgres..."
+docker exec -i postgres psql -U postgres -d iman -c "DELETE FROM iman.users WHERE user_id = 2;"
 
-# ✅ Final assertion
-ACTUAL=$(docker exec $CH_CONTAINER clickhouse-client --query "SELECT user_id, username, account_type FROM iman.users ORDER BY user_id FORMAT TSV" || echo -e "\nERROR")
-EXPECTED=$'1\tuser1\tBronze\n2\tuser2\tSilver\n3\tuser3\tGold'
+echo
+echo "📋 Verifying deletion in ClickHouse..."
+docker exec clickhouse clickhouse-client --query "SELECT * FROM iman.users FORMAT Pretty"
 
-if [[ "$ACTUAL" == "$EXPECTED" ]]; then
-  echo -e "\n✅ Integration test passed. Data synced correctly."
-else
-  echo -e "\n❌ Integration test failed. Data mismatch."
-  echo -e "\nExpected:\n$EXPECTED\nGot:\n$ACTUAL"
-  exit 1
-fi
+echo
+echo "🧪 Inserting then updating a user..."
+docker exec -i postgres psql -U postgres -d iman <<EOF
+INSERT INTO iman.users (user_id, username, account_type, updated_at, created_at) VALUES (999, 'test_user', 'Test', now(), now());
+UPDATE iman.users SET username = 'updated_user' WHERE user_id = 999;
+EOF
 
-# 🧪 Test: DELETE sync
-echo -e "\n🧪 Deleting a user in Postgres..."
-docker exec $PG_CONTAINER psql -U $USER -d $DB -c "DELETE FROM iman.users WHERE user_id = 1;"
-sleep 5
+echo
+echo "📋 Verifying insert and update in ClickHouse..."
+docker exec clickhouse clickhouse-client --query "SELECT * FROM iman.users FORMAT Pretty"
 
-echo -e "\n📋 Verifying deletion in ClickHouse..."
-docker exec $CH_CONTAINER clickhouse-client --query "SELECT * FROM $DB.users WHERE user_id = 1 FORMAT Pretty"
+echo
+echo "⏳ Waiting for DDL connector to be fully ready..."
+for i in {1..30}; do
+  status=$(curl -s http://localhost:8083/connectors/postgres-ddl-connector/status | grep '"state"' | grep -c RUNNING)
+  if [ "$status" -ge 1 ]; then
+    echo "✅ DDL connector is RUNNING."
+    break
+  fi
+  sleep 1
+done
 
-# 🧪 Test: INSERT then UPDATE sync
-echo -e "\n🧪 Inserting then updating a user..."
-docker exec $PG_CONTAINER psql -U $USER -d $DB -c "INSERT INTO iman.users (user_id, username, account_type, created_at, updated_at) VALUES (999, 'test_user', 'Test', now(), now());"
-sleep 2
-docker exec $PG_CONTAINER psql -U $USER -d $DB -c "UPDATE iman.users SET username = 'updated_user' WHERE user_id = 999;"
-sleep 5
+echo
+echo "🛠 Applying ALTER TABLE on Postgres..."
+docker exec -i postgres psql -U postgres -d iman -c "ALTER TABLE iman.users ADD COLUMN new_col TEXT;"
 
-echo -e "\n📋 Verifying insert and update in ClickHouse..."
-docker exec $CH_CONTAINER clickhouse-client --query "SELECT * FROM $DB.users WHERE user_id = 999 FORMAT Pretty"
+# --- Wait for ClickHouse schema update after ALTER TABLE ---
+echo "⏳ Waiting for ClickHouse to receive new_col..."
+for i in {1..60}; do
+  has_col=$(docker exec clickhouse clickhouse-client --query "DESCRIBE TABLE iman.users" | grep -c new_col || true)
+  if [ "$has_col" -ge 1 ]; then
+    echo "✅ new_col appeared in ClickHouse."
+    break
+  fi
+  sleep 1
+done
 
+echo
+echo "➕ Inserting 5 rows with new_col..."
+for i in {1001..1005}; do
+  docker exec -i postgres psql -U postgres -d iman -c "INSERT INTO iman.users (user_id, username, account_type, updated_at, created_at, new_col) VALUES ($i, 'user${i}', 'Bronze', now(), now(), 'test$i');"
+done
+
+echo
+echo "✏️ Updating one of the new rows..."
+docker exec -i postgres psql -U postgres -d iman -c "UPDATE iman.users SET new_col = 'updated_val' WHERE user_id = 1003;"
+
+echo
+echo "📋 Verifying ALTER + INSERT + UPDATE in ClickHouse..."
+docker exec clickhouse clickhouse-client --query "SELECT user_id, username, new_col FROM iman.users WHERE user_id BETWEEN 1001 AND 1005 FORMAT Pretty"

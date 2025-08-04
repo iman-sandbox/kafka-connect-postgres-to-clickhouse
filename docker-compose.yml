@@ -45,7 +45,9 @@ services:
       - kafka-network
 
   postgres:
-    image: postgres:15-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
     container_name: postgres
     ports:
       - "5432:5432"
