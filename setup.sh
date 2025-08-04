@@ -24,12 +24,19 @@ docker exec -i $CH_CONTAINER clickhouse-client --query "CREATE DATABASE IF NOT E
 docker exec -i $CH_CONTAINER clickhouse-client --query "USE $DB;"
 
 # 📦 Extract schema and generate DDL
-echo -e "\n📦 Extracting PostgreSQL schema and generating ClickHouse DDL..."
+echo -e "\n📦 Extracting PostgreSQL schema and generating ClickHouse DDLs for all tables..."
+
+TABLES=$(docker exec $PG_CONTAINER psql -U $USER -d $DB -Atc \
+  "SELECT table_name FROM information_schema.tables WHERE table_schema = '$DB' AND table_type='BASE TABLE';")
+
+for TABLE in $TABLES; do
+  echo -e "\n🔍 Processing table: $TABLE"
+
+  # Extract schema and build ClickHouse DDL
 DDL=$(docker exec $PG_CONTAINER psql -U $USER -d $DB -Atc "
+    WITH ch_columns AS (
   SELECT
-    'CREATE TABLE IF NOT EXISTS iman.users (' ||
-    string_agg(
-      column_name || ' ' ||
+        column_name,
       CASE data_type
         WHEN 'integer' THEN 'UInt32'
         WHEN 'bigint' THEN 'UInt64'
@@ -39,22 +46,30 @@ DDL=$(docker exec $PG_CONTAINER psql -U $USER -d $DB -Atc "
         WHEN 'timestamp without time zone' THEN 'DateTime64(6)'
         WHEN 'uuid' THEN 'UUID'
         ELSE 'String'
-      END,
-      ', '
-    ) || ') ENGINE = ReplacingMergeTree() ORDER BY ' ||
-    COALESCE(
-      (SELECT column_name FROM information_schema.columns WHERE table_name = 'users' AND column_name = 'user_id' LIMIT 1),
-      (SELECT column_name FROM information_schema.columns WHERE table_name = 'users' LIMIT 1)
-    ) || ';'
+        END AS ch_type
+      FROM information_schema.columns
+      WHERE table_schema = '$DB' AND table_name = '$TABLE'
+      ORDER BY ordinal_position
+    ),
+    pk AS (
+      SELECT column_name
   FROM information_schema.columns
-  WHERE table_name = 'users';
-")
+      WHERE table_schema = '$DB' AND table_name = '$TABLE' AND column_name = 'user_id'
+      LIMIT 1
+    )
+    SELECT
+      'CREATE TABLE IF NOT EXISTS $DB.$TABLE (' ||
+      string_agg(column_name || ' ' || ch_type, ', ') ||
+      ') ENGINE = ReplacingMergeTree() ORDER BY ' ||
+      COALESCE((SELECT column_name FROM pk), (SELECT column_name FROM ch_columns LIMIT 1)) || ';'
+    FROM ch_columns;
+  ")
 
+  echo -e "\n🛠 Applying DDL to ClickHouse for table $TABLE:"
+  echo "$DDL"
 
-# 🛠 Apply DDL
-echo -e "\n🛠 Applying generated DDL to ClickHouse..."
-echo $DDL
 docker exec $CH_CONTAINER clickhouse-client --query "$DDL"
+done
 
 # 🔌 Register PostgreSQL Source Connector
 echo -e "\n🧩 Registering Debezium PostgreSQL source connector..."
@@ -172,3 +187,22 @@ else
   echo -e "\nExpected:\n$EXPECTED\nGot:\n$ACTUAL"
   exit 1
 fi
+
+# 🧪 Test: DELETE sync
+echo -e "\n🧪 Deleting a user in Postgres..."
+docker exec $PG_CONTAINER psql -U $USER -d $DB -c "DELETE FROM iman.users WHERE user_id = 1;"
+sleep 5
+
+echo -e "\n📋 Verifying deletion in ClickHouse..."
+docker exec $CH_CONTAINER clickhouse-client --query "SELECT * FROM $DB.users WHERE user_id = 1 FORMAT Pretty"
+
+# 🧪 Test: INSERT then UPDATE sync
+echo -e "\n🧪 Inserting then updating a user..."
+docker exec $PG_CONTAINER psql -U $USER -d $DB -c "INSERT INTO iman.users (user_id, username, account_type, created_at, updated_at) VALUES (999, 'test_user', 'Test', now(), now());"
+sleep 2
+docker exec $PG_CONTAINER psql -U $USER -d $DB -c "UPDATE iman.users SET username = 'updated_user' WHERE user_id = 999;"
+sleep 5
+
+echo -e "\n📋 Verifying insert and update in ClickHouse..."
+docker exec $CH_CONTAINER clickhouse-client --query "SELECT * FROM $DB.users WHERE user_id = 999 FORMAT Pretty"
+
